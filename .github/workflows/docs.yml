@@ -63,19 +63,28 @@ jobs:
 
       - name: Set branch variables
         id: set-branches
+        # Untrusted event inputs arrive as environment variables, never spliced
+        # into shell text, so shell metacharacters in a dispatch input stay data.
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          REF_NAME: ${{ github.ref_name }}
+          REPO_SLUG: ${{ github.repository }}
+          INPUT_SOURCE_BRANCH: ${{ github.event.inputs.source_branch }}
+          INPUT_TARGET_BRANCH: ${{ github.event.inputs.target_branch }}
+          INPUT_REPOSITORY_URL: ${{ github.event.inputs.repository_url }}
         run: |
-          if [ "${{ github.event_name }}" = "push" ]; then
-            echo "source_branch=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-            echo "target_branch=${{ github.ref_name }}" >> $GITHUB_OUTPUT
-            echo "repository_url=https://github.com/${{ github.repository }}" >> $GITHUB_OUTPUT
-          elif [ "${{ github.event.inputs.source_branch }}" != "" ] && [ "${{ github.event.inputs.target_branch }}" != "" ]; then
-            echo "source_branch=${{ github.event.inputs.source_branch }}" >> $GITHUB_OUTPUT
-            echo "target_branch=${{ github.event.inputs.target_branch }}" >> $GITHUB_OUTPUT
-            echo "repository_url=${{ github.event.inputs.repository_url || format('https://github.com/{0}', github.repository) }}" >> $GITHUB_OUTPUT
+          if [ "$EVENT_NAME" = "push" ]; then
+            echo "source_branch=$REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "target_branch=$REF_NAME" >> "$GITHUB_OUTPUT"
+            echo "repository_url=https://github.com/$REPO_SLUG" >> "$GITHUB_OUTPUT"
+          elif [ -n "$INPUT_SOURCE_BRANCH" ] && [ -n "$INPUT_TARGET_BRANCH" ]; then
+            echo "source_branch=$INPUT_SOURCE_BRANCH" >> "$GITHUB_OUTPUT"
+            echo "target_branch=$INPUT_TARGET_BRANCH" >> "$GITHUB_OUTPUT"
+            echo "repository_url=${INPUT_REPOSITORY_URL:-https://github.com/$REPO_SLUG}" >> "$GITHUB_OUTPUT"
           else
-            echo "source_branch=main" >> $GITHUB_OUTPUT
-            echo "target_branch=main" >> $GITHUB_OUTPUT
-            echo "repository_url=https://github.com/${{ github.repository }}" >> $GITHUB_OUTPUT
+            echo "source_branch=main" >> "$GITHUB_OUTPUT"
+            echo "target_branch=main" >> "$GITHUB_OUTPUT"
+            echo "repository_url=https://github.com/$REPO_SLUG" >> "$GITHUB_OUTPUT"
           fi
 
       - name: Set up Python 3.13
@@ -133,15 +142,18 @@ jobs:
           DIAGRAM_DEPTH_LEVEL: '2'
           CACHING_DOCUMENTATION: 'false'
           ENABLE_MONITORING: 'false'
+          OUTPUT_FORMAT: ${{ github.event.inputs.output_format }}
+          OUTPUT_DIR: ${{ github.event.inputs.output_directory }}
+          REPO_URL: ${{ steps.set-branches.outputs.repository_url }}
+          SOURCE_BRANCH: ${{ steps.set-branches.outputs.source_branch }}
+          TARGET_BRANCH: ${{ steps.set-branches.outputs.target_branch }}
         run: |
           # Ensure repos directory exists
           mkdir -p repos
 
-          OUTPUT_FORMAT="${{ github.event.inputs.output_format || '.md' }}"
-          OUTPUT_DIR="${{ github.event.inputs.output_directory || '.codeboarding' }}"
-          REPO_URL="${{ steps.set-branches.outputs.repository_url }}"
-          SOURCE_BRANCH="${{ steps.set-branches.outputs.source_branch }}"
-          TARGET_BRANCH="${{ steps.set-branches.outputs.target_branch }}"
+          # An empty dispatch input falls back to the documented default.
+          OUTPUT_FORMAT="${OUTPUT_FORMAT:-.md}"
+          OUTPUT_DIR="${OUTPUT_DIR:-.codeboarding}"
 
           echo "Generating docs for: $REPO_URL"
           echo "Source branch: $SOURCE_BRANCH"
@@ -151,7 +163,7 @@ jobs:
 
           # Check if previous analysis exists in target repo for incremental updates
           EXISTING_ANALYSIS_DIR=""
-          TARGET_ANALYSIS_DIR="${{ github.workspace }}/target-repo/$OUTPUT_DIR"
+          TARGET_ANALYSIS_DIR="$GITHUB_WORKSPACE/target-repo/$OUTPUT_DIR"
           if [ -f "$TARGET_ANALYSIS_DIR/analysis.json" ]; then
             echo "Found existing analysis - will attempt incremental update"
             EXISTING_ANALYSIS_DIR="$TARGET_ANALYSIS_DIR"
@@ -159,25 +171,34 @@ jobs:
             echo "No existing analysis found - will run full analysis"
           fi
 
-          uv run python -c "
+          # A quoted heredoc passes the values as data: no shell expansion
+          # reaches Python source, so a quote in an input cannot add statements.
+          export EXISTING_ANALYSIS_DIR
+          uv run python - <<'PY'
+          import os
+
           from github_action import generate_analysis
-          existing = '$EXISTING_ANALYSIS_DIR' or None
+
+          existing = os.environ.get("EXISTING_ANALYSIS_DIR") or None
           result_dir = generate_analysis(
-              repo_url='$REPO_URL',
-              source_branch='$SOURCE_BRANCH',
-              target_branch='$TARGET_BRANCH',
-              extension='$OUTPUT_FORMAT',
-              output_dir='$OUTPUT_DIR',
+              repo_url=os.environ["REPO_URL"],
+              source_branch=os.environ["SOURCE_BRANCH"],
+              target_branch=os.environ["TARGET_BRANCH"],
+              extension=os.environ["OUTPUT_FORMAT"],
+              output_dir=os.environ["OUTPUT_DIR"],
               existing_analysis_dir=existing,
           )
-          print(f'Generated files in: {result_dir}')
-          "
+          print(f"Generated files in: {result_dir}")
+          PY
 
       - name: Copy generated files to target repo
         id: copy-files
+        env:
+          OUTPUT_DIR: ${{ github.event.inputs.output_directory }}
+          OUTPUT_FORMAT: ${{ github.event.inputs.output_format }}
         run: |
-          OUTPUT_DIR="${{ github.event.inputs.output_directory || '.codeboarding' }}"
-          OUTPUT_FORMAT="${{ github.event.inputs.output_format || '.md' }}"
+          OUTPUT_DIR="${OUTPUT_DIR:-.codeboarding}"
+          OUTPUT_FORMAT="${OUTPUT_FORMAT:-.md}"
           ENGINE_TEMP=$(find codeboarding-engine/temp -maxdepth 1 -mindepth 1 -type d | head -1)
 
           if [ -z "$ENGINE_TEMP" ]; then
@@ -220,9 +241,12 @@ jobs:
       - name: Generate architecture documentation
         if: steps.git-changes.outputs.has_git_changes == 'true'
         working-directory: target-repo
+        env:
+          OUTPUT_DIR: ${{ github.event.inputs.output_directory }}
+          OUTPUT_FORMAT: ${{ github.event.inputs.output_format }}
         run: |
-          OUTPUT_DIR="${{ github.event.inputs.output_directory || '.codeboarding' }}"
-          output_format="${{ github.event.inputs.output_format || '.md' }}"
+          OUTPUT_DIR="${OUTPUT_DIR:-.codeboarding}"
+          output_format="${OUTPUT_FORMAT:-.md}"
           file_extension="${output_format}"
 
           mkdir -p docs/development
@@ -247,16 +271,21 @@ jobs:
       - name: Commit and push changes
         if: steps.git-changes.outputs.has_git_changes == 'true'
         working-directory: target-repo
+        env:
+          MARKDOWN_COUNT: ${{ steps.copy-files.outputs.markdown_files_created }}
+          JSON_COUNT: ${{ steps.copy-files.outputs.json_files_created }}
+          OUTPUT_FORMAT: ${{ github.event.inputs.output_format }}
+          REPO_URL: ${{ steps.set-branches.outputs.repository_url }}
         run: |
           git config --local user.email "action@github.com"
           git config --local user.name "GitHub Action"
           git add .
           git commit -m "docs: update codeboarding documentation
 
-          Documentation files created/updated: ${{ steps.copy-files.outputs.markdown_files_created }}
-          JSON files created/updated: ${{ steps.copy-files.outputs.json_files_created }}
-          Output format: ${{ github.event.inputs.output_format || '.md' }}
-          Repository analyzed: ${{ steps.set-branches.outputs.repository_url }}
+          Documentation files created/updated: ${MARKDOWN_COUNT}
+          JSON files created/updated: ${JSON_COUNT}
+          Output format: ${OUTPUT_FORMAT:-.md}
+          Repository analyzed: ${REPO_URL}
 
           Generated directly in GitHub Actions (no external server).
           "
